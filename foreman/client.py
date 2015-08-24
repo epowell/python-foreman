@@ -105,6 +105,7 @@ class ForemanVersionException(Exception):
 
 class MethodAPIDescription(object):
     exclude_html_reg = re.compile('</?[^>/]+/?>')
+    resource_pattern = re.compile(r'^/api(/v[12])?/(?P<resource>\w+).*')
 
     def __init__(self, resource, method, api):
         self._method = copy.deepcopy(method)
@@ -113,17 +114,28 @@ class MethodAPIDescription(object):
         self.url = self._api['api_url']
         self.url_params = re.findall('/:([^/]+)(?:/|$)', self.url)
         self.params = self._method['params']
-        # special case for the api root
-        if self.url == '/api':
-            self.resource = 'api'
-        else:
-            self.resource = self.url.split('/', 3)[2]
+        self.resource = self.parse_resource_from_url(self.url) or ''
         self.name = self._get_name()
         self.http_method = self._api['http_method']
         self.short_desc = self._api['short_description'] or ''
 
     def __repr__(self):
         return "<resource:%s, name:%s>" % (self.resource, self.name)
+
+    def parse_resource_from_url(self, url):
+        """
+        Returns the appropriate resource name for the given URL.
+
+        :param url:  API URL stub, like: '/api/hosts'
+        :return: Resource name, like 'hosts', or None if not found
+        """
+        # special case for the api root
+        if url == '/api':
+            return 'api'
+
+        match = self.resource_pattern.match(url)
+        if match:
+            return match.groupdict().get('resource', None)
 
     def _get_name(self):
         """
@@ -297,7 +309,7 @@ def parse_resource_definition(resource_name, resource_dct):
         '_conflicting_methods': [],
     }
 
-    # methods in foreign_methods are ment for other resources,
+    # methods in foreign_methods are meant for other resources,
     # that is, the url and the resource field do not match /api/{resource}
     foreign_methods = {}
 
@@ -313,7 +325,7 @@ def parse_resource_definition(resource_name, resource_dct):
             api = MethodAPIDescription(resource_name, method, api)
 
             if api.resource != resource_name:
-                # this means that the json apipie passes says that an
+                # this means that the json apipie passed says that an
                 # endpoint in the form: /api/{resource}/* belongs to
                 # {different_resource}, we just put it under {resource}
                 # later, storing it under _foreign_methods for now as we
@@ -322,7 +334,7 @@ def parse_resource_definition(resource_name, resource_dct):
                 if api.name in functions:
                     old_api = functions.get(api.name).defs
                     logging.warning(
-                        "There is conflict trying to redefine a method "
+                        "There is a conflict trying to redefine a method "
                         "for a foreign resource (%s): \n"
                         "\tresource:\n"
                         "\tapipie_resource: %s\n"
@@ -346,7 +358,7 @@ def parse_resource_definition(resource_name, resource_dct):
                 if api.name in new_dict['_own_methods']:
                     old_api = new_dict.get(api.name).defs
                     logging.warning(
-                        "There is conflict trying to redefine method "
+                        "There is a conflict trying to redefine method "
                         "(%s): \n"
                         "\tapipie_resource: %s\n"
                         "\tnew_api: %s\n"
@@ -523,7 +535,7 @@ class Foreman(object):
             will try to get them from the remote Foreman instance (it needs
             you to have disabled use_cache in the apipie configuration in your
             foreman instance)
-        :param sctrict_cache: If True, will not use a similar version
+        :param strict_cache: If True, will not use a similar version
             definitions file
         :param timeout: Timeout in seconds for each http request (default 60)
             If None or 0, then no timeout.
@@ -549,7 +561,7 @@ class Foreman(object):
             )
         self.url = url
         self._req_params = {}
-        self.timeout = {'DEFAULT': timeout}
+        self.timeout = {'DEFAULT': timeout or None}
 
         if timeout_post is not None:
             self.set_timeout(timeout_post, 'POST')
@@ -614,13 +626,26 @@ class Foreman(object):
         main page and extract the version from the footer.
         """
         params = dict(self._req_params)
-        home_page = self.session.get(self.url, **params)
-        match = re.search(r'Version\s+(?P<version>\S+)', home_page.text)
+        home_page = requests.get(
+            self.url,
+            verify=self.session.verify,
+            timeout=self.get_timeout('GET'),
+            **params
+        )
+
+        match = re.search(
+            r'Version\s+(?P<version>[^\s<]+)?',
+            home_page.text,
+        )
         if match:
             return match.groupdict()['version']
         else:
             # on newer versions the version can be taken from the status page
-            res = self.session.get(self.url + '/api/status', **params)
+            res = self.session.get(
+                self.url + '/api/status',
+                timeout=self.get_timeout('GET'),
+                **params
+            )
             if res.status_code < 200 or res.status_code >= 300:
                 raise ForemanException(
                     res,
@@ -685,10 +710,11 @@ class Foreman(object):
 
     def _get_remote_defs(self):
         """
-        Retrieves the json definitions from remote forem
+        Retrieves the json definitions from remote foreman instance.
         """
         res = self.session.get(
             '%s/%s' % (self.url, 'apidoc/v%s.json' % self.api_version),
+            timeout=self.get_timeout('GET'),
             **self._req_params
         )
 
@@ -721,6 +747,7 @@ class Foreman(object):
         return data
 
     def _get_defs(self, use_cache, strict_cache):
+        data = None
         if use_cache:
             try:
                 logging.debug("Trying local cached definitions first")
@@ -810,7 +837,7 @@ class Foreman(object):
                 resource_data,
             )
             if not resource_data['_own_methods']:
-                logging.debug('Skiping empty resource %s' % resource_name)
+                logging.debug('Skipping empty resource %s' % resource_name)
                 continue
             instance = new_resource(self)
             setattr(self, resource_name, instance)
